@@ -17,6 +17,9 @@ import com.github.istin.dmtools.atlassian.confluence.model.Content;
 import io.github.furstenheim.CopyDown;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.jsoup.Jsoup;
+import org.jsoup.nodes.Document;
+import org.jsoup.nodes.Element;
 
 import java.io.File;
 import java.io.IOException;
@@ -24,8 +27,12 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
+import java.util.Queue;
 import java.util.Set;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -173,65 +180,267 @@ public class CliExecutionHelper {
      * and all page attachments to {@code inputFolderPath/confluence/} so CLI agents can read them
      * without web access.
      * <p>
-     * Uses {@link Confluence#parseUris} (domain-aware, same mechanism as ContextOrchestrator)
-     * to detect URLs, then {@link Confluence#contentByUrl} to get the full {@link Content} object,
-     * {@link Confluence#getContentAttachments} + {@link Confluence#downloadAttachment} to fetch
-     * attachments — reusing the same pattern as {@code ConfluenceMermaidIndexIntegration}.
-     * If {@code confluence} is null the method is a no-op.
+     * This overload preserves the original behavior: depth 0 (only pages explicitly linked in the
+     * ticket text) and attachments enabled.
      *
      * @param textContent     Any text that may contain Confluence URLs (e.g. full ticket text)
      * @param inputFolderPath The base input folder (e.g. {@code input/PROJ-123})
      * @param confluence      Confluence client; if {@code null} the method does nothing
      */
     public void writeConfluencePagesFile(String textContent, Path inputFolderPath, Confluence confluence) {
+        writeConfluencePagesFile(textContent, inputFolderPath, confluence, 0, true);
+    }
+
+    /**
+     * Fetches Confluence pages referenced in {@code textContent} and writes both the page text
+     * and all page attachments to {@code inputFolderPath/confluence/} so CLI agents can read them
+     * without web access.
+     * <p>
+     * Recursively follows internal Confluence links and {@code children} macros up to
+     * {@code confluenceDepth} levels. Attachments are downloaded for every fetched page unless
+     * {@code confluenceAttachments} is {@code false}.
+     * <p>
+     * Uses {@link Confluence#parseUris} to detect URLs, {@link Confluence#contentByUrl} /
+     * {@link Confluence#findContent} to resolve pages, and
+     * {@link Confluence#downloadPageAttachments} for attachments — reusing the same patterns as
+     * {@code ConfluenceMermaidIndexIntegration}.
+     *
+     * @param textContent           Any text that may contain Confluence URLs (e.g. full ticket text)
+     * @param inputFolderPath       The base input folder (e.g. {@code input/PROJ-123})
+     * @param confluence            Confluence client; if {@code null} the method does nothing
+     * @param confluenceDepth       How many levels of linked/child pages to follow (0 = only ticket links)
+     * @param confluenceAttachments Whether to download attachments for each fetched page
+     */
+    public void writeConfluencePagesFile(String textContent, Path inputFolderPath, Confluence confluence,
+                                         int confluenceDepth, boolean confluenceAttachments) {
         if (confluence == null || textContent == null || textContent.isBlank()) return;
         try {
-            Set<String> urls = confluence.parseUris(textContent);
-            if (urls == null || urls.isEmpty()) {
+            Set<String> seedUrls = confluence.parseUris(textContent);
+            if (seedUrls == null || seedUrls.isEmpty()) {
                 logger.info("No Confluence URLs detected in ticket text");
                 return;
             }
-            logger.info("Found {} Confluence URL(s), writing to input/confluence/...", urls.size());
+            logger.info("Found {} Confluence URL(s), writing to input/confluence/ with depth={} attachments={}",
+                    seedUrls.size(), confluenceDepth, confluenceAttachments);
 
             Path confluenceFolder = inputFolderPath.resolve("confluence");
             Files.createDirectories(confluenceFolder);
 
-            int written = 0;
-            for (String url : urls) {
+            Queue<PageLevel> queue = new LinkedList<>();
+            Set<String> processedIds = new HashSet<>();
+            Set<String> processedUrls = new HashSet<>();
+
+            // Seed queue with pages linked directly from the ticket text (level 0)
+            for (String url : seedUrls) {
                 try {
                     Content page = confluence.contentByUrl(url);
-                    if (page == null) {
+                    processedUrls.add(url);
+                    if (page != null && page.getId() != null) {
+                        queue.add(new PageLevel(page, 0));
+                    } else {
                         logger.warn("Confluence returned null Content for {}", url);
-                        continue;
                     }
+                } catch (Exception e) {
+                    logger.warn("Could not fetch Confluence seed page {} (skipping): {}", url, e.getMessage());
+                }
+            }
+
+            int written = 0;
+            int index = 0;
+            while (!queue.isEmpty()) {
+                PageLevel current = queue.poll();
+                Content page = current.page;
+                int level = current.level;
+                String contentId = page.getId();
+
+                if (!processedIds.add(contentId)) {
+                    logger.debug("Skipping already processed Confluence page {}", contentId);
+                    continue;
+                }
+
+                try {
+                    String title = page.getTitle();
+                    String safeName = deriveSafeName(title, null, index++);
+                    Path pageFolder = confluenceFolder.resolve(safeName);
+                    Files.createDirectories(pageFolder);
 
                     // Write page text
-                    String title = page.getTitle();
-                    String safeName = deriveSafeName(title, url, written);
                     String bodyText = page.getStorage() != null && page.getStorage().getValue() != null
                             ? page.getStorage().getValue().trim() : "";
                     if (!bodyText.isBlank()) {
                         String markdownText = convertHtmlToMarkdown(bodyText);
-                        Path mdFile = confluenceFolder.resolve(safeName + ".md");
+                        Path mdFile = pageFolder.resolve(safeName + ".md");
                         Files.write(mdFile, markdownText.getBytes(StandardCharsets.UTF_8));
                         logger.info("Wrote Confluence page → {} ({} chars, markdown)", mdFile, markdownText.length());
                         written++;
+
+                        // Discover related pages for the next depth level
+                        if (level < confluenceDepth) {
+                            List<Content> related = discoverRelatedPages(page, confluence, processedIds, processedUrls);
+                            for (Content relatedPage : related) {
+                                queue.add(new PageLevel(relatedPage, level + 1));
+                            }
+                        }
                     } else {
                         logger.warn("Confluence page '{}' has empty body, skipping text write", title);
                     }
 
-                    // Download attachments (same pattern as ConfluenceMermaidIndexIntegration)
-                    String contentId = page.getId();
-                    if (contentId != null && !contentId.isBlank()) {
-                        downloadConfluenceAttachments(confluence, contentId, confluenceFolder.toFile());
+                    // Download attachments
+                    if (confluenceAttachments && contentId != null && !contentId.isBlank()) {
+                        downloadConfluenceAttachments(confluence, contentId, pageFolder.toFile());
                     }
                 } catch (Exception e) {
-                    logger.warn("Could not fetch Confluence page {} (skipping): {}", url, e.getMessage());
+                    logger.warn("Could not process Confluence page {} (skipping): {}", contentId, e.getMessage());
                 }
             }
-            logger.info("Wrote {}/{} Confluence pages to input/confluence/", written, urls.size());
+            logger.info("Wrote {} Confluence page(s) to input/confluence/", written);
         } catch (Exception e) {
             logger.warn("writeConfluencePagesFile failed (non-fatal): {}", e.getMessage());
+        }
+    }
+
+    /**
+     * Discovers pages related to {@code page}: external/full Confluence URLs, children-macro children,
+     * and internal {@code ac:link} references to other pages.
+     */
+    private List<Content> discoverRelatedPages(Content page, Confluence confluence,
+                                                Set<String> alreadyQueuedIds, Set<String> alreadyProcessedUrls) {
+        List<Content> related = new ArrayList<>();
+        String storageHtml = page.getStorage() != null ? page.getStorage().getValue() : null;
+        if (storageHtml == null || storageHtml.isBlank()) {
+            return related;
+        }
+
+        // 1. External/full Confluence URLs inside the page body
+        try {
+            Set<String> urls = confluence.parseUris(storageHtml);
+            if (urls != null) {
+                for (String url : urls) {
+                    if (!alreadyProcessedUrls.add(url)) {
+                        continue;
+                    }
+                    try {
+                        Content linked = confluence.contentByUrl(url);
+                        if (linked != null && linked.getId() != null && !alreadyQueuedIds.contains(linked.getId())) {
+                            related.add(linked);
+                        }
+                    } catch (Exception e) {
+                        logger.debug("Could not resolve linked Confluence URL {}: {}", url, e.getMessage());
+                    }
+                }
+            }
+        } catch (Exception e) {
+            logger.debug("Failed to parse URIs from page {}: {}", page.getId(), e.getMessage());
+        }
+
+        // 2. Children macros
+        if (hasChildrenMacro(storageHtml)) {
+            try {
+                List<Content> children = confluence.getChildrenOfContentById(page.getId());
+                if (children != null) {
+                    for (Content child : children) {
+                        if (child != null && child.getId() != null && !alreadyQueuedIds.contains(child.getId())) {
+                            related.add(child);
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                logger.warn("Could not fetch children for page {}: {}", page.getId(), e.getMessage());
+            }
+        }
+
+        // 3. Internal ac:link page references
+        List<PageLink> internalLinks = extractInternalPageLinks(storageHtml);
+        for (PageLink link : internalLinks) {
+            try {
+                Content linked;
+                if (link.spaceKey != null && !link.spaceKey.isBlank()) {
+                    linked = confluence.findContent(link.title, link.spaceKey);
+                } else {
+                    linked = confluence.findContent(link.title);
+                }
+                if (linked != null && linked.getId() != null && !alreadyQueuedIds.contains(linked.getId())) {
+                    related.add(linked);
+                }
+            } catch (Exception e) {
+                logger.debug("Could not resolve internal Confluence link '{}' (space={}): {}",
+                        link.title, link.spaceKey, e.getMessage());
+            }
+        }
+
+        return related;
+    }
+
+    /**
+     * Parses Confluence storage format HTML and returns all internal page links
+     * ({@code <ac:link><ri:page ri:content-title="..." [ri:space-key="..."]/></ac:link>}).
+     */
+    private List<PageLink> extractInternalPageLinks(String storageHtml) {
+        List<PageLink> links = new ArrayList<>();
+        if (storageHtml == null || storageHtml.isBlank()) {
+            return links;
+        }
+        try {
+            Document doc = Jsoup.parseBodyFragment(storageHtml);
+            for (Element link : doc.getElementsByTag("ac:link")) {
+                Element page = link.getElementsByTag("ri:page").first();
+                if (page != null) {
+                    String title = page.attr("ri:content-title");
+                    String spaceKey = page.attr("ri:space-key");
+                    if (title != null && !title.isBlank()) {
+                        links.add(new PageLink(title, spaceKey));
+                    }
+                }
+            }
+        } catch (Exception e) {
+            logger.debug("Failed to extract internal Confluence links: {}", e.getMessage());
+        }
+        return links;
+    }
+
+    /**
+     * Returns true if the storage format contains a {@code children} macro.
+     */
+    private boolean hasChildrenMacro(String storageHtml) {
+        if (storageHtml == null || storageHtml.isBlank()) {
+            return false;
+        }
+        try {
+            Document doc = Jsoup.parseBodyFragment(storageHtml);
+            for (Element macro : doc.getElementsByTag("ac:structured-macro")) {
+                if ("children".equalsIgnoreCase(macro.attr("ac:name"))) {
+                    return true;
+                }
+            }
+        } catch (Exception e) {
+            logger.debug("Failed to check for children macro: {}", e.getMessage());
+        }
+        return false;
+    }
+
+    /**
+     * Simple carrier for a page + its depth level in the BFS.
+     */
+    private static final class PageLevel {
+        final Content page;
+        final int level;
+
+        PageLevel(Content page, int level) {
+            this.page = page;
+            this.level = level;
+        }
+    }
+
+    /**
+     * Simple carrier for an internal Confluence page link.
+     */
+    private static final class PageLink {
+        final String title;
+        final String spaceKey;
+
+        PageLink(String title, String spaceKey) {
+            this.title = title;
+            this.spaceKey = spaceKey;
         }
     }
 
