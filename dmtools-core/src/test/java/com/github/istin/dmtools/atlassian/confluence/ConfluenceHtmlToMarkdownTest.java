@@ -277,4 +277,19 @@ public class ConfluenceHtmlToMarkdownTest {
         assertTrue("Should preserve code body", markdown.contains("System.out.println"));
         assertTrue("Should preserve hello string", markdown.contains("hello"));
     }
+
+    @Test
+    public void testToMarkdown_childrenMacroReplacedWithPlaceholder() {
+        String html = "<p>Other Templates</p>" +
+            "<ac:structured-macro ac:name=\"children\">" +
+            "<ac:parameter ac:name=\"allChildren\">true</ac:parameter>" +
+            "</ac:structured-macro>";
+
+        String markdown = ConfluenceStorageMarkdown.toMarkdown(html);
+
+        assertTrue("Should keep heading", markdown.contains("Other Templates"));
+        assertTrue("Should replace children macro with placeholder", markdown.contains("Child pages"));
+        assertFalse("Should not leak parameter value", markdown.contains("allChildren"));
+        assertFalse("Should not leak parameter value", markdown.contains("true"));
+    }
 }

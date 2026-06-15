@@ -288,12 +288,17 @@ public final class ConfluenceStorageMarkdown {
                 codeEl.html(StringEscapeUtils.escapeHtml4(code));
                 pre.appendChild(codeEl);
                 macro.replaceWith(pre);
+            } else if ("children".equals(macroName) || "childpages".equals(macroName)) {
+                macro.replaceWith(doc.createElement("p").text("[Child pages]"));
             } else {
                 Element richBody = macro.getElementsByTag("ac:rich-text-body").first();
                 if (richBody != null) {
                     Element div = doc.createElement("div");
                     div.html(richBody.html());
                     macro.replaceWith(div);
+                } else {
+                    // Remove unknown macros so their parameter text doesn't leak into Markdown.
+                    macro.remove();
                 }
             }
         }
