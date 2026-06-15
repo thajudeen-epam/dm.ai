@@ -734,6 +734,28 @@ public class Confluence extends AtlassianRestClient implements UriToObject {
         return downloaded;
     }
 
+    @MCPTool(
+        name = "confluence_download_pages",
+        description = "Download Confluence pages and their attachments to a local folder. Recursively follows linked pages, children macros, and internal ac:link references up to the specified depth.",
+        integration = "confluence",
+        category = "content_management"
+    )
+    public String downloadPages(
+        @MCPParam(name = "urlStrings", description = "Array of Confluence page URLs to download", required = true, example = "['https://wiki.example.com/wiki/spaces/SPACE/pages/123/Page']")
+        String[] urlStrings,
+        @MCPParam(name = "outputPath", description = "Local folder path where pages and attachments will be saved", required = true, example = "/tmp/confluence-pages")
+        String outputPath,
+        @MCPParam(name = "depth", description = "How many levels of linked/child pages to follow. Default is 1.", required = false, example = "1")
+        Integer depth,
+        @MCPParam(name = "downloadAttachments", description = "Whether to download page attachments. Default is true.", required = false, example = "true")
+        Boolean downloadAttachments
+    ) throws IOException {
+        int actualDepth = depth != null ? depth : 1;
+        boolean actualAttachments = downloadAttachments != null ? downloadAttachments : true;
+        int written = new ConfluencePageDownloader(this).downloadPages(urlStrings, new File(outputPath), actualDepth, actualAttachments);
+        return "Downloaded " + written + " Confluence page(s) to " + outputPath;
+    }
+
     /**
      * Converts a MIME media type to a file extension.
      * @param mediaType the MIME type (e.g., "image/jpeg", "image/png")
