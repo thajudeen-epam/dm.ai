@@ -120,7 +120,7 @@ public class Teammate extends AbstractJob<Teammate.TeammateParams, List<ResultIt
         private int timerIntervalSeconds = 60;
 
         @SerializedName("confluenceDepth")
-        private int confluenceDepth = 0;
+        private int confluenceDepth = 1;
 
         @SerializedName("confluenceAttachments")
         private boolean confluenceAttachments = true;
