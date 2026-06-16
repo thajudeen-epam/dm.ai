@@ -3,6 +3,7 @@
 
 package com.github.istin.dmtools.gitlab.model;
 
+import com.github.istin.dmtools.common.model.IStats;
 import com.github.istin.dmtools.common.model.IUser;
 import org.json.JSONException;
 import org.json.JSONObject;
@@ -41,9 +42,27 @@ public class GitLabCommitTest {
     }
 
     @Test
-    public void testGetStats() {
+    public void testGetStats_returnsNullWhenAbsent() {
         GitLabCommit commit = new GitLabCommit();
-        assertThrows(UnsupportedOperationException.class, commit::getStats);
+        assertNull(commit.getStats());
+    }
+
+    @Test
+    public void testGetStats_parsesAdditionsDeletionsAndTotal() throws JSONException {
+        JSONObject stats = new JSONObject();
+        stats.put("total", 30);
+        stats.put("additions", 20);
+        stats.put("deletions", 10);
+        JSONObject json = new JSONObject();
+        json.put("stats", stats);
+
+        GitLabCommit commit = new GitLabCommit(json);
+        IStats result = commit.getStats();
+
+        assertNotNull(result);
+        assertEquals(30, result.getTotal());
+        assertEquals(20, result.getAdditions());
+        assertEquals(10, result.getDeletions());
     }
 
     @Test
